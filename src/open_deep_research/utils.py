@@ -1,9 +1,12 @@
 """Utility functions and helpers for the Deep Research agent."""
 
+from open_deep_research.state import DetectedAttack, AttackType, SecurityState
 import asyncio
 import logging
 import os
 import warnings
+import aiofiles
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
@@ -32,6 +35,262 @@ from tavily import AsyncTavilyClient
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
+
+MULTI_FILE_SEARCH_DESCRIPTION = (
+    "Search tool that reads content from multiple local files. "
+    "Searches through all configured files and returns combined results."
+)
+    
+@tool(description=MULTI_FILE_SEARCH_DESCRIPTION)
+async def multi_file_search(
+    query: str,
+    config: RunnableConfig = None
+) -> str:
+    """Search through multiple local files specified in configuration.
+
+    Args:
+        query: Search query to look for in files
+        config: Runtime configuration containing file paths
+
+    Returns:
+        Combined content from all files with search highlights
+    """
+    try:
+        # Get configuration
+        configurable = Configuration.from_runnable_config(config)
+        
+        # Поддерживаем оба варианта: один файл или список
+        file_paths = configurable.local_file_path
+        
+        # Если это строка (старый формат), делаем список
+        if isinstance(file_paths, str):
+            file_paths = [file_paths]
+        # Если это уже список, используем как есть
+        elif not isinstance(file_paths, list):
+            return f"Error: Invalid file path configuration: {file_paths}"
+        
+        all_content = []
+        search_results = []
+        
+        # Ищем по каждому файлу
+        for file_path in file_paths:
+            path = Path(file_path)
+            
+            # Check if file exists
+            if not path.exists():
+                all_content.append(f"⚠️ File not found: {file_path}")
+                continue
+            
+            # Read file
+            async with aiofiles.open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = await f.read()
+            
+            # Добавляем метаданные файла
+            file_info = f"""
+## 📄 File: {path.name}
+**Path:** `{file_path}`
+**Size:** {len(content)} characters
+**Modified:** {datetime.fromtimestamp(path.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')}
+"""
+            
+            # Ищем вхождения запроса (case-insensitive)
+            lower_content = content.lower()
+            lower_query = query.lower()
+            
+            if lower_query in lower_content:
+                # Нашли совпадение - показываем контекст
+                idx = lower_content.find(lower_query)
+                start = max(0, idx - 200)
+                end = min(len(content), idx + len(query) + 400)
+                
+                highlighted = (
+                    content[start:idx] + 
+                    "🔍 **" + content[idx:idx + len(query)] + "**" + 
+                    content[idx + len(query):end]
+                )
+                
+                search_results.append(f"""
+{file_info}
+✅ **MATCH FOUND** for query: "{query}"
+
+### Context around match:
+...{highlighted}...
+""")
+            else:
+                # Не нашли - показываем начало файла
+                preview = content[:1000] + ("..." if len(content) > 1000 else "")
+                search_results.append(f"""
+{file_info}
+❌ No direct match for "{query}"
+
+### File preview (first 1000 chars):
+{preview}
+""")
+            
+            # Сохраняем полный контент для итогов
+            all_content.append(f"{file_info}\n\n### Full content length: {len(content)} chars")
+        
+        # Формируем итоговый ответ
+        if search_results:
+            # Если были поисковые запросы
+            response = "## 🔎 Multi-File Search Results\n\n"
+            response += f"**Query:** {query}\n"
+            response += f"**Files searched:** {len(file_paths)}\n\n"
+            response += "---\n\n".join(search_results)
+            
+            # Добавляем суммарную статистику
+            response += f"\n\n### 📊 Search Summary:\n"
+            response += f"- Files processed: {len(file_paths)}\n"
+            response += f"- Total characters: {sum(len(str(c)) for c in all_content):,}\n"
+            
+        else:
+            # Просто показываем все файлы
+            response = "## 📁 All Local Files Content\n\n"
+            response += "\n\n---\n\n".join(all_content)
+        
+        return response
+        
+    except Exception as e:
+        return f"Error in multi-file search: {str(e)}"
+
+LOCAL_FILE_SEARCH_DESCRIPTION = (
+    "Search tool that reads content from a local file. "
+    "Useful for testing and development when internet access is not available. "
+    "The tool always returns the content of the configured file regardless of the query."
+)
+
+@tool(description=LOCAL_FILE_SEARCH_DESCRIPTION)
+async def local_file_search(
+    query: str,
+    config: RunnableConfig = None
+) -> str:
+    """Read content from a local file specified in configuration.
+
+    Args:
+        query: Search query (ignored, always returns file content)
+        config: Runtime configuration containing file path
+
+    Returns:
+        Content of the local file with metadata
+    """
+    try:
+        # Get configuration
+        configurable = Configuration.from_runnable_config(config)
+        file_path = configurable.local_file_path
+        
+        # Convert to Path object
+        path = Path(file_path)
+        
+        # Check if file exists
+        if not path.exists():
+            return f"Error: File not found at path '{file_path}'. Please check your configuration."
+        
+        # Read file content asynchronously
+        async with aiofiles.open(path, 'r', encoding='utf-8') as f:
+            content = await f.read()
+        
+        # Format the response
+        formatted_response = f"""
+## Local File Search Results
+
+**File Path:** `{file_path}`
+**File Size:** {len(content)} characters
+**Last Modified:** {path.stat().st_mtime}
+
+### Content Preview:
+{content[:2000]}{'...' if len(content) > 2000 else ''}
+
+### Full Content Length:
+{len(content)} characters total
+
+### Note:
+This is a local file search stub. The query "{query}" was ignored, 
+and the content of the configured file was returned instead.
+"""
+        
+        return formatted_response
+        
+    except PermissionError:
+        return f"Error: Permission denied when trying to read file '{file_path}'."
+    except Exception as e:
+        return f"Error reading file '{file_path}': {str(e)}"
+    
+async def get_search_tool(
+    search_api: SearchAPI,
+    config: RunnableConfig | None = None
+):
+    """Configure and return search tools based on the specified API provider.
+    
+    Args:
+        search_api: The search API provider to use
+        
+    Returns:
+        List of configured search tool objects for the specified provider
+    """
+    if search_api == SearchAPI.ANTHROPIC:
+        # Anthropic's native web search with usage limits
+        return [{
+            "type": "web_search_20250305", 
+            "name": "web_search", 
+            "max_uses": 5
+        }]
+    
+    elif search_api == SearchAPI.LOCAL_FILE:
+        # Конфигурация локального поиска
+        configurable = Configuration.from_runnable_config(config)
+        
+        # Выбираем тип поиска
+        if configurable.local_search_type == "rag":
+            search_tool = rag_file_search_tool  # Используйте инструмент, а не функцию
+            print("🔍 Using RAG semantic search")
+        else:
+            search_tool = multi_file_search
+            print("🔍 Using text-based search")
+        
+        # ИСПРАВЛЕНО: Проверяем, является ли search_tool инструментом или функцией
+        if hasattr(search_tool, 'metadata'):
+            # Это инструмент с метаданными
+            search_tool.metadata = {
+                **(search_tool.metadata or {}), 
+                "type": "search", 
+                "name": "web_search"
+            }
+        else:
+            # Это функция - создаем обертку с метаданными
+            from langchain_core.tools import tool
+            
+            @tool(description=getattr(search_tool, '__doc__', 'Search tool'))
+            async def wrapped_search_tool(query: str, config: RunnableConfig = None):
+                return await search_tool(query=query, config=config)
+            
+            wrapped_search_tool.metadata = {
+                "type": "search", 
+                "name": "web_search"
+            }
+            search_tool = wrapped_search_tool
+        
+        return [search_tool]
+        
+    elif search_api == SearchAPI.OPENAI:
+        # OpenAI's web search preview functionality
+        return [{"type": "web_search_preview"}]
+        
+    elif search_api == SearchAPI.TAVILY:
+        # Configure Tavily search tool with metadata
+        search_tool = tavily_search
+        search_tool.metadata = {
+            **(search_tool.metadata or {}), 
+            "type": "search", 
+            "name": "web_search"
+        }
+        return [search_tool]
+        
+    elif search_api == SearchAPI.NONE:
+        # No search functionality configured
+        return []
+        
+    # Default fallback for unknown search API types
+    return []
 
 ##########################
 # Tavily Search Tool Utils
@@ -135,6 +394,130 @@ async def tavily_search(
     
     return formatted_output
 
+RAG_FILE_SEARCH_DESCRIPTION = (
+    "Semantic search through local files using AI embeddings. "
+    "Understands the meaning of your query, not just keywords. "
+    "Returns the most relevant passages from all configured files."
+)
+
+@tool(description=RAG_FILE_SEARCH_DESCRIPTION)
+async def rag_file_search_tool(
+    query: str,
+    k: Annotated[int, InjectedToolArg] = 5,
+    config: RunnableConfig = None
+) -> str:
+    """Инструмент для семантического поиска через RAG."""
+    return await rag_file_search(query, k, config)
+
+async def rag_file_search(
+    query: str,
+    k: Annotated[int, InjectedToolArg] = 5,
+    config: RunnableConfig = None
+) -> str:
+    """Semantic search through local files using vector embeddings."""
+    try:
+        print(f"🔍 RAG поиск запущен: '{query}'")
+        
+        # Get configuration
+        configurable = Configuration.from_runnable_config(config)
+        
+        # Получаем пути к файлам
+        file_paths = configurable.local_file_path
+        if isinstance(file_paths, str):
+            # Разделяем строку по запятым
+            file_paths = [p.strip() for p in file_paths.split(',')]
+        elif not isinstance(file_paths, list):
+            return f"Error: Invalid file path configuration: {file_paths}"
+        
+        print(f"🔧 Получены пути: {file_paths}")
+        
+        # Ищем файлы в разных местах
+        valid_paths = []
+        for fp in file_paths:
+            path = Path(fp)
+            
+            # Вариант 1: Как есть
+            if path.exists():
+                valid_paths.append(str(path.absolute()))
+                print(f"✅ Файл найден (вариант 1): {fp}")
+                continue
+            
+            # Вариант 2: Относительно текущего каталога
+            current_dir = Path.cwd()
+            alt_path = current_dir / fp
+            if alt_path.exists():
+                valid_paths.append(str(alt_path.absolute()))
+                print(f"✅ Файл найден (вариант 2): {alt_path}")
+                continue
+            
+            # Вариант 3: Убрать ./src/ если есть
+            if fp.startswith('./src/'):
+                alt_path2 = Path(fp.replace('./src/', './'))
+                if alt_path2.exists():
+                    valid_paths.append(str(alt_path2.absolute()))
+                    print(f"✅ Файл найден (вариант 3): {alt_path2}")
+                    continue
+            
+            # Вариант 4: Искать в родительском каталоге
+            parent_dir = Path.cwd().parent
+            alt_path3 = parent_dir / fp
+            if alt_path3.exists():
+                valid_paths.append(str(alt_path3.absolute()))
+                print(f"✅ Файл найден (вариант 4): {alt_path3}")
+                continue
+            
+            print(f"⚠️ Файл не найден: {fp}")
+        
+        if not valid_paths:
+            # Покажем доступные файлы для отладки
+            current_dir = Path.cwd()
+            print(f"📁 Текущий каталог: {current_dir}")
+            print(f"📁 Файлы в текущем каталоге:")
+            for f in current_dir.glob('*.txt'):
+                print(f"  - {f.name}")
+            print(f"📁 Файлы в родительском каталоге:")
+            parent_dir = current_dir.parent
+            for f in parent_dir.glob('*.txt'):
+                print(f"  - {parent_dir.name}/{f.name}")
+            
+            return "❌ Не найдено ни одного валидного файла для поиска."
+        
+        # Импортируем менеджер внутри функции чтобы избежать circular imports
+        try:
+            from open_deep_research.rag_manager import get_rag_manager
+            rag_manager = get_rag_manager()
+        except ImportError as e:
+            print(f"❌ Ошибка импорта RAG менеджера: {e}")
+            return f"❌ Ошибка импорта RAG системы. Проверьте файл rag_manager.py"
+        
+        # Используем менеджер
+        print(f"🔍 Ищем по {len(valid_paths)} файлам...")
+        results = await rag_manager.search(
+            query=query,
+            file_paths=valid_paths,
+            k=k,
+            config=config
+        )
+        
+        print(f"✅ RAG поиск завершен успешно")
+        return results
+        
+    except Exception as e:
+        import traceback
+        error_msg = f"❌ Ошибка в RAG поиске: {str(e)}"
+        print(error_msg)
+        print("Трассировка:")
+        traceback.print_exc()
+        
+        # Fallback на обычный поиск
+        try:
+            print("🔄 Пробуем обычный текстовый поиск как fallback...")
+            from .utils import multi_file_search
+            fallback_result = await multi_file_search(query, config)
+            return f"{error_msg}\n\n🔄 **Используем обычный поиск:**\n\n{fallback_result}"
+        except:
+            return f"{error_msg}\n\n❌ Fallback также не сработал."
+    
 async def tavily_search_async(
     search_queries, 
     max_results: int = 5, 
@@ -527,44 +910,6 @@ async def load_mcp_tools(
 ##########################
 # Tool Utils
 ##########################
-
-async def get_search_tool(search_api: SearchAPI):
-    """Configure and return search tools based on the specified API provider.
-    
-    Args:
-        search_api: The search API provider to use (Anthropic, OpenAI, Tavily, or None)
-        
-    Returns:
-        List of configured search tool objects for the specified provider
-    """
-    if search_api == SearchAPI.ANTHROPIC:
-        # Anthropic's native web search with usage limits
-        return [{
-            "type": "web_search_20250305", 
-            "name": "web_search", 
-            "max_uses": 5
-        }]
-        
-    elif search_api == SearchAPI.OPENAI:
-        # OpenAI's web search preview functionality
-        return [{"type": "web_search_preview"}]
-        
-    elif search_api == SearchAPI.TAVILY:
-        # Configure Tavily search tool with metadata
-        search_tool = tavily_search
-        search_tool.metadata = {
-            **(search_tool.metadata or {}), 
-            "type": "search", 
-            "name": "web_search"
-        }
-        return [search_tool]
-        
-    elif search_api == SearchAPI.NONE:
-        # No search functionality configured
-        return []
-        
-    # Default fallback for unknown search API types
-    return []
     
 async def get_all_tools(config: RunnableConfig):
     """Assemble complete toolkit including research, search, and MCP tools.
@@ -581,7 +926,7 @@ async def get_all_tools(config: RunnableConfig):
     # Add configured search tools
     configurable = Configuration.from_runnable_config(config)
     search_api = SearchAPI(get_config_value(configurable.search_api))
-    search_tools = await get_search_tool(search_api)
+    search_tools = await get_search_tool(search_api, config)
     tools.extend(search_tools)
     
     # Track existing tool names to prevent conflicts

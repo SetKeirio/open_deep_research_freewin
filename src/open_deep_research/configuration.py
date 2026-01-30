@@ -2,11 +2,21 @@
 
 import os
 from enum import Enum
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union, Literal
 
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+
+class SecurityConfig(BaseModel):
+    """Конфигурация безопасности."""
+    enable_security_analysis: bool = True
+    security_model: str = "gpt-4"  # Модель для анализа безопасности
+    security_threshold: float = 0.7  # Порог безопасности
+    enable_content_sanitization: bool = True
+    require_balanced_view: bool = True
+    remove_links: bool = True
+    remove_emails: bool = True
 
 class SearchAPI(Enum):
     """Enumeration of available search API providers."""
@@ -14,6 +24,8 @@ class SearchAPI(Enum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     TAVILY = "tavily"
+    LOCAL_FILE = "local_file"
+    LOCAL_RAG = "local_rag"
     NONE = "none"
 
 class MCPConfig(BaseModel):
@@ -74,6 +86,43 @@ class Configuration(BaseModel):
             }
         }
     )
+
+    local_search_type: Literal["text", "rag"] = Field(
+        default="rag",  # По умолчанию RAG
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "rag",
+                "description": "Type of local file search",
+                "options": [
+                    {"label": "Text Search", "value": "text"},
+                    {"label": "RAG Semantic Search", "value": "rag"}
+                ]
+            }
+        }
+    )
+
+    # Для локального поиска, заменяет Tavily
+    local_file_path: Union[str, List[str]] = Field(
+        default=["./src/data.txt", "./src/link_fraudulent.txt"],
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "./src/data.txt,./src/link_fraudulent.txt",
+                "description": "Path(s) to local files for search. Can be single file or comma-separated list."
+            }
+        }
+    )
+
+    @field_validator('local_file_path', mode='before')
+    @classmethod
+    def parse_file_paths(cls, v):
+        """Parse file paths from string or list."""
+        if isinstance(v, str):
+            # Разделяем по запятым, убираем пробелы
+            return [p.strip() for p in v.split(',') if p.strip()]
+        return v
+
     # Research Configuration
     search_api: SearchAPI = Field(
         default=SearchAPI.TAVILY,
@@ -85,6 +134,7 @@ class Configuration(BaseModel):
                 "options": [
                     {"label": "Tavily", "value": SearchAPI.TAVILY.value},
                     {"label": "OpenAI Native Web Search", "value": SearchAPI.OPENAI.value},
+                    {"label": "Local File Search", "value": SearchAPI.LOCAL_FILE.value},
                     {"label": "Anthropic Native Web Search", "value": SearchAPI.ANTHROPIC.value},
                     {"label": "None", "value": SearchAPI.NONE.value}
                 ]
@@ -232,6 +282,8 @@ class Configuration(BaseModel):
         }
     )
 
+    security_config: SecurityConfig = Field(default_factory=SecurityConfig)
+
 
     @classmethod
     def from_runnable_config(
@@ -240,11 +292,13 @@ class Configuration(BaseModel):
         """Create a Configuration instance from a RunnableConfig."""
         configurable = config.get("configurable", {}) if config else {}
         field_names = list(cls.model_fields.keys())
+        security_config = configurable.get("security_config", {}) if configurable else {}
         values: dict[str, Any] = {
             field_name: os.environ.get(field_name.upper(), configurable.get(field_name))
             for field_name in field_names
         }
-        return cls(**{k: v for k, v in values.items() if v is not None})
+        return cls(**{k: v for k, v in values.items() if v is not None},
+                   security_config=SecurityConfig(**security_config))
 
     class Config:
         """Pydantic configuration."""

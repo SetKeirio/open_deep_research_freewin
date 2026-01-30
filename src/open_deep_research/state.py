@@ -8,6 +8,39 @@ from langgraph.graph import MessagesState
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+from typing import List, Optional, Dict, Any, TypedDict, Union
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
+from pydantic import BaseModel, Field
+from enum import Enum
+
+MessageLikeRepresentation = Union[BaseMessage, Dict[str, Any], str, List[Union[str, Dict[str, Any]]]]
+
+class AttackType(str, Enum):
+    """Типы обнаруженных атак."""
+    FALSE_INFORMATION = "false_information"
+    BIASED_DATA = "biased_data"
+    CONFIRMATION_BIAS = "confirmation_bias"
+    COMMAND_INJECTION = "command_injection"
+    LINK_INJECTION = "link_injection"
+    EMAIL_INJECTION = "email_injection"
+    UNBALANCED_VIEW = "unbalanced_view"
+
+
+class DetectedAttack(BaseModel):
+    """Обнаруженная атака."""
+    type: AttackType
+    description: str
+    source: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    mitigation: str
+
+
+class SecurityState(BaseModel):
+    """Состояние безопасности."""
+    detected_attacks: List[DetectedAttack] = []
+    sanitized_content: Optional[str] = None
+    needs_human_review: bool = False
+    safety_score: float = Field(default=1.0, ge=0.0, le=1.0)
 
 ###################
 # Structured Outputs
@@ -62,14 +95,17 @@ def override_reducer(current_value, new_value):
 class AgentInputState(MessagesState):
     """InputState is only 'messages'."""
 
-class AgentState(MessagesState):
-    """Main agent state containing messages and research data."""
-    
-    supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]
+class AgentState(TypedDict, total=False):
+    messages: List[MessageLikeRepresentation]  # <-- ВСЕГДА одинаковый тип!
     research_brief: Optional[str]
-    raw_notes: Annotated[list[str], override_reducer] = []
-    notes: Annotated[list[str], override_reducer] = []
-    final_report: str
+    supervisor_messages: List[MessageLikeRepresentation]  # <-- Тот же тип
+    researcher_messages: List[MessageLikeRepresentation]  # <-- Тот же тип
+    notes: List[str]
+    raw_notes: List[str]
+    research_iterations: int
+    tool_call_iterations: int
+    security_state: Optional[Any]  # Пока Any, потом заменим
+    original_research_content: Optional[str]
 
 class SupervisorState(TypedDict):
     """State for the supervisor that manages research tasks."""
